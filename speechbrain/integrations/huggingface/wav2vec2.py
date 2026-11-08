@@ -266,6 +266,13 @@ class Wav2Vec2Pretrain(HFTransformersInterface):
         Returns
         -------
         Wav2vec encoded outputs.
+
+        Raises
+        ------
+        ValueError
+            If any waveform yields fewer than two valid feature frames for
+            negative sampling, or no valid feature frames are selected as
+            prediction targets in the batch.
         """
         batch_size, raw_sequence_length = wav.shape
 
@@ -276,26 +283,52 @@ class Wav2Vec2Pretrain(HFTransformersInterface):
             raw_sequence_length
         ).item()
 
+        padding_mask = make_padding_masks(wav, wav_len=wav_lens)
+        feature_padding_mask = None
+        if padding_mask is not None:
+            feature_lengths = self.model._get_feat_extract_output_lengths(
+                padding_mask.sum(-1), add_adapter=False
+            ).cpu()
+            if (feature_lengths < 2).any():
+                raise ValueError(
+                    "Each waveform must yield at least two feature frames "
+                    "to sample negatives."
+                )
+            feature_padding_mask = torch.arange(sequence_length).unsqueeze(
+                0
+            ) < feature_lengths.unsqueeze(1)
+        elif sequence_length < 2:
+            raise ValueError(
+                "Each waveform must yield at least two feature frames "
+                "to sample negatives."
+            )
+
         # 1. Compute the indices that will be masked
         mask_time_indices = _compute_mask_indices(
             (batch_size, sequence_length),
             mask_prob=self.mask_prob,
             mask_length=self.mask_length,
+            attention_mask=feature_padding_mask,
         )
+        if feature_padding_mask is not None:
+            # The sampler may mark a dummy padding index for very short inputs.
+            mask_time_indices &= feature_padding_mask.numpy()
+        if not mask_time_indices.any():
+            raise ValueError(
+                "No valid feature frames were selected for masking. "
+                "Increase mask_prob, decrease mask_length, or use longer waveforms."
+            )
         torch_mask_time_indices = torch.tensor(
             mask_time_indices,
             device=wav.device,
             dtype=torch.long,
         )
-        padding_mask = make_padding_masks(wav, wav_len=wav_lens)
-
-        # 2. Sample the negative samples from the entire sequence.
-        # Fairseq does it only on the masked indices, but this only work if you
-        # have long sentences. For more versatility, we sample on the entire sequence.
-        # value.
-        full_sentence_indices = np.ones((batch_size, sequence_length))
-
-        # print(np.sum(mask_time_indices, axis=1))
+        # 2. Sample negatives from all valid frames, not just masked frames.
+        full_sentence_indices = (
+            feature_padding_mask.numpy()
+            if feature_padding_mask is not None
+            else np.ones((batch_size, sequence_length), dtype=bool)
+        )
         negative_sample_indices = torch.tensor(
             transformers.models.wav2vec2.modeling_wav2vec2._sample_negative_indices(
                 (batch_size, sequence_length),
